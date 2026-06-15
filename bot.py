@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
-import hashlib
+import requests
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types, F
@@ -16,7 +16,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8990195591:AAEdvqBuko34uisWUgmAgP4GjG__slW1Qmo")
 OWNER_PHONE = os.getenv("OWNER_PHONE", "+99362237781")
 
-# Railway ephemeral storage - /tmp yzyna galmaz
+# TMCELL API
+TMCELL_BASE_URL = "https://my.tmcell.tm/api"  # Hakyky URL
+
 DB_PATH = os.getenv("DB_PATH", "/tmp/meylo_bot.db")
 
 logging.basicConfig(level=logging.INFO)
@@ -119,62 +121,107 @@ def back_kb():
         resize_keyboard=True
     )
 
-# ========== TMCELL API ==========
+# ========== TMCELL API (HER ULANYJY ÜÇIN) ==========
 class TMCELLAPI:
     def __init__(self):
-        self.base_url = "http://my.tmcell.tm/api"
+        self.base_url = TMCELL_BASE_URL
     
     def login(self, phone: str, password: str):
+        """Her ulanyjynyň Şahsy otag kody bilen girişi"""
         try:
-            import requests
             response = requests.post(
                 f"{self.base_url}/auth/login",
-                json={"username": phone, "password": password},
-                timeout=15
+                json={
+                    "username": phone,
+                    "password": password
+                },
+                timeout=15,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                }
             )
-            return response.json()
-        except:
-            if len(password) >= 6:
+            
+            if response.status_code == 200:
+                data = response.json()
                 return {
                     "success": True,
-                    "token": hashlib.sha256(f"{phone}{password}".encode()).hexdigest(),
-                    "balance": 21.1,
+                    "token": data.get("token"),
+                    "balance": data.get("balance", 0),
                     "message": "Giriş üstünlikli"
                 }
-            return {"success": False, "message": "Nädogry parol"}
+            else:
+                return {
+                    "success": False,
+                    "message": f"Nädogry kod ýa-da nomer"
+                }
+                
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Baglanyşyk ýalňyşy: {str(e)}"
+            }
     
     def get_balance(self, token: str):
+        """Hakyky balans"""
         try:
-            import requests
             response = requests.get(
                 f"{self.base_url}/balance",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
                 timeout=10
             )
-            return response.json()
-        except:
-            return {"success": True, "balance": 21.1}
+            
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    "success": True,
+                    "balance": data.get("balance", 0)
+                }
+            else:
+                return {"success": False, "balance": 0}
+                
+        except Exception as e:
+            return {"success": False, "balance": 0}
     
     def transfer(self, token: str, from_phone: str, to_phone: str, amount: float):
+        """Pul geçirmek"""
         try:
-            import requests
             response = requests.post(
                 f"{self.base_url}/transfer",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
                 json={
                     "from_msisdn": from_phone,
                     "to_msisdn": to_phone,
-                    "amount": amount
+                    "amount": amount,
+                    "type": "balance_transfer"
                 },
                 timeout=15
             )
-            return response.json()
-        except:
+            
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    "success": True,
+                    "transaction_id": data.get("transaction_id"),
+                    "message": data.get("message", "Töleg üstünlikli"),
+                    "new_balance": data.get("new_balance", 0)
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Transfer ýalňyş: {response.status_code}"
+                }
+                
+        except Exception as e:
             return {
-                "success": True,
-                "transaction_id": f"TRX{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                "message": f"{amount} TMT {to_phone} nomere geçirildi",
-                "new_balance": 21.1 - amount
+                "success": False,
+                "message": f"Transfer ýalňyşy: {str(e)}"
             }
 
 tmcell = TMCELLAPI()
@@ -190,13 +237,28 @@ async def cmd_start(message: Message, state: FSMContext):
     user = get_user(message.from_user.id)
     
     if user:
-        await message.answer(
-            f"👋 Hoş geldiňiz!\n\n"
-            f"📱 Nomer: +{user[1]}\n"
-            f"💰 Bot balansy: {user[4]} TMT\n\n"
-            f"🏠 Esasy menýu",
-            reply_markup=main_kb()
-        )
+        # Ulanyjynyň balansyny barla
+        await message.answer("⏳ Şahsy otaga giriş edilýar...")
+        
+        login_result = tmcell.login(user[1], user[2])
+        if login_result["success"]:
+            real_balance = login_result["balance"]
+            await message.answer(
+                f"✅ Giriş üstünlikli!\n\n"
+                f"📱 Nomer: +{user[1]}\n"
+                f"💰 TMCELL balansy: {real_balance} TMT\n"
+                f"🤖 Bot balansy: {user[4]} TMT\n\n"
+                f"🏠 Esasy menýu",
+                reply_markup=main_kb()
+            )
+        else:
+            await message.answer(
+                f"⚠️ Giriş şowsuz: {login_result['message']}\n\n"
+                f"📱 Nomer: +{user[1]}\n"
+                f"🤖 Bot balansy: {user[4]} TMT\n\n"
+                f"🏠 Esasy menýu",
+                reply_markup=main_kb()
+            )
         await state.set_state(UserState.main_menu)
     else:
         await message.answer(
@@ -234,11 +296,13 @@ async def process_so_code(message: Message, state: FSMContext):
     data = await state.get_data()
     phone = data['phone']
     
-    await message.answer("⏳ Giriş barlanylýar...")
+    await message.answer("⏳ Şahsy otaga giriş edilýar...")
     
+    # HAKYKy TMCELL API - HER ULANYJY ÜÇIN
     result = tmcell.login(phone, so_password)
     
     if result["success"]:
+        # Ulanyjynyň maglumatlaryny ýatda sakla
         save_user(message.from_user.id, phone, so_password, result["token"])
         
         await message.answer(
@@ -263,9 +327,23 @@ async def add_balance(message: Message, state: FSMContext):
         await message.answer("Ilki giriş ediň. /start")
         return
     
+    # Ulanyjynyň hakyky balansyny barla
+    await message.answer("⏳ Şahsy otaga giriş edilýar...")
+    
+    login_result = tmcell.login(user[1], user[2])
+    if login_result["success"]:
+        real_balance = login_result["balance"]
+    else:
+        await message.answer(
+            f"❌ Giriş şowsuz: {login_result['message']}\n"
+            f"Täzeden synanyşyň. /start"
+        )
+        return
+    
     await message.answer(
         f"💰 Bot balansy doldurmak\n\n"
         f"📱 Nomer: +{user[1]}\n"
+        f"💰 TMCELL balansy: {real_balance} TMT\n"
         f"📥 Pul geçiriljek: {OWNER_PHONE}\n\n"
         f"💵 Mukdar saýlaň:",
         reply_markup=amount_kb()
@@ -296,11 +374,8 @@ async def process_amount(message: Message, state: FSMContext):
         phone = user[1]
         so_password = user[2]
         
-        await message.answer(
-            f"⏳ Awtomatik töleg amala aşyrylýar...\n"
-            f"📱 +{phone} → {OWNER_PHONE}\n"
-            f"💰 {amount} TMT"
-        )
+        # 1. HAKYKy giriş - ŞAHSY OTAG
+        await message.answer("⏳ Şahsy otaga giriş edilýar...")
         
         login_result = tmcell.login(phone, so_password)
         if not login_result["success"]:
@@ -308,32 +383,41 @@ async def process_amount(message: Message, state: FSMContext):
             return
         
         token = login_result["token"]
-        balance_result = tmcell.get_balance(token)
-        current_balance = balance_result.get("balance", 0)
+        real_balance = login_result["balance"]
         
-        if current_balance < amount:
+        # 2. Balansy barla
+        if real_balance < amount:
             await message.answer(
-                f"❌ Balans ýeterlik däl!\n"
-                f"💰 Mevcut balans: {current_balance} TMT\n"
-                f"📉 Islenen: {amount} TMT"
+                f"❌ Balans ýeterlik däl!\n\n"
+                f"💰 Hakyky balansyňyz: {real_balance} TMT\n"
+                f"📉 Islenen: {amount} TMT\n\n"
+                f"Az mukdar saýlaň:"
             )
-            add_transaction(message.from_user.id, amount, "FAILED_BALANCE", phone, OWNER_PHONE)
             return
+        
+        # 3. HAKYKy pul çek we geçir
+        await message.answer(
+            f"⏳ Hakyky töleg amala aşyrylýar...\n"
+            f"📱 +{phone} → {OWNER_PHONE}\n"
+            f"💰 {amount} TMT"
+        )
         
         transfer_result = tmcell.transfer(token, phone, OWNER_PHONE, amount)
         
         if transfer_result["success"]:
+            # Bot balansyny artdyr
             update_balance(message.from_user.id, amount)
             add_transaction(message.from_user.id, amount, "SUCCESS", phone, OWNER_PHONE)
             
             new_bot_balance = get_balance(message.from_user.id)
             
             await message.answer(
-                f"✅ Töleg üstünlikli!\n\n"
+                f"✅ HAKYKy töleg üstünlikli!\n\n"
                 f"📱 Çekilen nomer: +{phone}\n"
                 f"📥 Geçirilen nomer: {OWNER_PHONE}\n"
                 f"💰 Mukdar: {amount} TMT\n"
-                f"🆔 Tranzaksiýa: {transfer_result.get('transaction_id', 'N/A')}\n\n"
+                f"🆔 Tranzaksiýa: {transfer_result.get('transaction_id', 'N/A')}\n"
+                f"💰 Galan balans: {transfer_result.get('new_balance', 'Bilinmekän')} TMT\n\n"
                 f"🤖 Bot balansyňyz: {new_bot_balance} TMT",
                 reply_markup=main_kb()
             )
@@ -341,7 +425,8 @@ async def process_amount(message: Message, state: FSMContext):
             add_transaction(message.from_user.id, amount, "FAILED_TRANSFER", phone, OWNER_PHONE)
             await message.answer(
                 f"❌ Töleg şowsuz!\n"
-                f"Sebäp: {transfer_result['message']}",
+                f"Sebäp: {transfer_result['message']}\n\n"
+                f"📞 Kömek: {OWNER_PHONE}",
                 reply_markup=main_kb()
             )
         
@@ -357,11 +442,19 @@ async def my_account(message: Message):
         await message.answer("Ilki giriş ediň. /start")
         return
     
+    # Hakyky balansy barla
+    login_result = tmcell.login(user[1], user[2])
+    if login_result["success"]:
+        real_balance = login_result["balance"]
+    else:
+        real_balance = "Bilinmekän"
+    
     await message.answer(
         f"📊 Hasabym\n\n"
         f"👤 ID: {message.from_user.id}\n"
         f"📱 Nomer: +{user[1]}\n"
-        f"💰 Bot balansy: {user[4]} TMT\n"
+        f"💰 TMCELL balansy: {real_balance} TMT\n"
+        f"🤖 Bot balansy: {user[4]} TMT\n"
         f"📅 Hasap açylan: {user[5][:10] if user[5] else 'N/A'}",
         reply_markup=main_kb()
     )
@@ -376,7 +469,7 @@ async def help_cmd(message: Message):
         f"   (0831 belgä SMS ugradyp görüň)\n"
         f"4️⃣ '💰 Balans doldur' saýlaň\n"
         f"5️⃣ Mukdar saýlaň\n"
-        f"6️⃣ Pul awtomatik çekilýär!\n\n"
+        f"6️⃣ Bot Şahsy otaga girip pul çekýär!\n\n"
         f"📞 Kömek: {OWNER_PHONE}",
         reply_markup=main_kb()
     )
@@ -392,3 +485,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+              
