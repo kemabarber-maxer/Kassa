@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import re
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types, F
@@ -18,7 +19,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ========== KONFIGURASIYA ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8990195591:AAEdvqBuko34uisWUgmAgP4GjG__slW1Qmo")
@@ -109,67 +109,97 @@ def back_kb():
         resize_keyboard=True
     )
 
-# ========== SELENIUM TMCELL (DIŇE BALANS BARLA) ==========
+# ========== SELENIUM TMCELL ==========
 class TMCELLSelenium:
     def __init__(self):
         self.driver = None
     
     def setup_driver(self):
+        """Chrome browser gurna - Railway üçin"""
         chrome_options = Options()
+        
+        # Headless mode
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         
-        try:
-            service = Service(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        except:
-            self.driver = webdriver.Chrome(options=chrome_options)
+        # Chrome binary ýolu (Dockerfile-dan)
+        chrome_options.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
         
-        self.driver.implicitly_wait(10)
+        # ChromeDriver ýolu
+        chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+        
+        service = Service(executable_path=chromedriver_path)
+        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        self.driver.implicitly_wait(15)
     
     def login_and_get_balance(self, phone: str, password: str):
         """Şahsy otaga girip balansy al"""
         try:
-            if not self.driver:
-                self.setup_driver()
+            self.setup_driver()
             
             # 1. Saýta giriň
             self.driver.get("https://my.tmcell.tm")
+            logging.info("Sayta girildi")
             
-            # 2. "Şahsy otag" saýla (eger gerek bolsa)
-            # Suratda görkezilen ýaly
+            # 2. "Şahsy otag" saýla (eger dropdown bar bolsa)
+            try:
+                dropdown = WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located((By.XPATH, "//select"))
+                )
+                # Option saýla
+                from selenium.webdriver.support.ui import Select
+                select = Select(dropdown)
+                select.select_by_visible_text("Şahsy otag")
+            except:
+                logging.info("Dropdown tapylmady, geçildi")
             
-            # 3. Nomer giriz
-            # 993 + 62237781 bölünýär
+            # 3. Nomer giriz (993 + 62237781)
+            # Suratda görkezilen ýaly: 993 aýry, 62237781 aýry
             phone_input = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, "//input[@type='tel' or @name='phone']"))
+                EC.presence_of_element_located((By.XPATH, "//input[@type='tel' or @name='msisdn' or @placeholder]"))
             )
             phone_input.clear()
             phone_input.send_keys(phone.replace("993", ""))  # 62237781
+            logging.info(f"Nomer girildi: {phone.replace('993', '')}")
             
             # 4. Parol giriz
             password_input = self.driver.find_element(By.XPATH, "//input[@type='password']")
             password_input.clear()
             password_input.send_keys(password)
+            logging.info("Parol girildi")
             
             # 5. Giriş bas
             login_button = self.driver.find_element(By.XPATH, "//button[contains(text(), 'ULGAMA GIR')]")
             login_button.click()
+            logging.info("Giris basyldy")
             
-            # 6. Balansy gözle
+            # 6. Balansy gözle (suratda görkezilen ýaly)
+            # "11.24 manat" ýa-da "Balans"
             try:
-                balance_element = WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'balance') or contains(text(), 'TMT')]"))
+                # Biraz garaş
+                import time
+                time.sleep(3)
+                
+                # Balans element-i
+                balance_element = WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'manat') or contains(text(), 'Balans')]"))
                 )
                 balance_text = balance_element.text
+                logging.info(f"Balans text: {balance_text}")
                 
                 # Balansy parse et
-                import re
-                balance_match = re.search(r'(\d+\.?\d*)', balance_text)
-                balance = float(balance_match.group(1)) if balance_match else 0
+                balance_match = re.search(r'(\d+\.?\d*)\s*manat', balance_text, re.IGNORECASE)
+                if balance_match:
+                    balance = float(balance_match.group(1))
+                else:
+                    # Başga format
+                    balance_match = re.search(r'(\d+\.?\d*)', balance_text)
+                    balance = float(balance_match.group(1)) if balance_match else 0
                 
                 return {
                     "success": True,
@@ -177,8 +207,10 @@ class TMCELLSelenium:
                     "message": f"Balans: {balance} TMT"
                 }
                 
-            except:
-                # Balans tapylmady, ýöne giriş üstünlikli
+            except Exception as e:
+                logging.error(f"Balans tapylmady: {e}")
+                # Screenshot al
+                self.driver.save_screenshot("/tmp/balance_error.png")
                 return {
                     "success": True,
                     "balance": 0,
@@ -187,6 +219,9 @@ class TMCELLSelenium:
                 
         except Exception as e:
             logging.error(f"Selenium error: {e}")
+            # Screenshot al
+            if self.driver:
+                self.driver.save_screenshot("/tmp/login_error.png")
             return {
                 "success": False,
                 "message": f"Ýalňyş: {str(e)}"
@@ -255,7 +290,7 @@ async def process_so_code(message: Message, state: FSMContext):
     data = await state.get_data()
     phone = data['phone']
     
-    await message.answer("⏳ Şahsy otaga giriş edilýar... (Bu biraz wagt alýar)")
+    await message.answer("⏳ Şahsy otaga giriş edilýar... (Bu 10-20 sekunt wagt alýar)")
     
     # SELENIUM arkaly balansy barla
     result = tmcell.login_and_get_balance(phone, so_password)
@@ -285,22 +320,12 @@ async def add_balance(message: Message, state: FSMContext):
         await message.answer("Ilki giriş ediň. /start")
         return
     
-    # Balansy täzeden barla
-    await message.answer("⏳ TMCELL balansy barlanylýar...")
-    
-    result = tmcell.login_and_get_balance(user[1], user[2])
-    
-    if result["success"]:
-        tmcell_balance = result["balance"]
-    else:
-        tmcell_balance = "Bilinmekän"
-    
     await message.answer(
         f"💰 Bot balansy doldurmak\n\n"
         f"📱 Nomer: +{user[1]}\n"
-        f"💰 TMCELL balansy: {tmcell_balance} TMT\n"
-        f"🤖 Bot balansy: {user[3]} TMT\n\n"
-        f"💵 Mukdar saýlaň:",
+        f"📥 Pul geçiriljek: {OWNER_PHONE}\n\n"
+        f"⚠️ my.tmcell.tm sahypasynda awtomatik pul geçirmek mümkin däl.\n"
+        f"💵 Mukdar saýlaň (bot balansy ýatda saklar):",
         reply_markup=amount_kb()
     )
     await state.set_state(UserState.waiting_amount)
@@ -326,20 +351,18 @@ async def process_amount(message: Message, state: FSMContext):
             await message.answer("Ilki giriş ediň. /start")
             return
         
-        # EGER TMCELL-da pul geçirmek ýok bolsa:
-        await message.answer(
-            f"⚠️ Üzginiňiz!\n\n"
-            f"my.tmcell.tm sahypasynda awtomatik pul geçirmek funksiýasy ýok.\n\n"
-            f"💰 Siziň TMCELL balansyňyz: {amount} TMT\n"
-            f"📥 Pul geçirmek üçin:\n"
-            f"1. *100*{amount}*{OWNER_PHONE.replace('+', '')}# USSD giriziň\n"
-            f"2. ýa-da TMCELL ilçihanasyna ýüz tutuň\n\n"
-            f"Bot balansy dolduruldy: +{amount} TMT",
-            reply_markup=main_kb()
-        )
-        
         # Bot balansyny artdyr (ulanyjy elden pul geçirse)
         update_balance(message.from_user.id, amount)
+        
+        await message.answer(
+            f"✅ Bot balansy dolduruldy!\n\n"
+            f"💰 Mukdar: {amount} TMT\n"
+            f"🤖 Bot balansyňyz: {get_balance(message.from_user.id)} TMT\n\n"
+            f"📥 Pul geçirmek üçin:\n"
+            f"USSD: *100*{amount}*{OWNER_PHONE.replace('+', '')}#\n"
+            f"ýa-da TMCELL ilçihanasyna ýüz tutuň",
+            reply_markup=main_kb()
+        )
         
         await state.set_state(UserState.main_menu)
         
@@ -369,9 +392,7 @@ async def help_cmd(message: Message):
         f"1️⃣ /start - Boty başlat\n"
         f"2️⃣ TMCELL nomeriňizi giriziň\n"
         f"3️⃣ Şahsy otag parolyňyzy giriziň\n"
-        f"4️⃣ Bot balansyňyzy doldurmak üçin:\n"
-        f"   - TMCELL balansyňyzdan pul geçiriň\n"
-        f"   - {OWNER_PHONE} nomere\n\n"
+        f"4️⃣ Bot balansy doldurmak üçin pul geçiriň\n\n"
         f"📞 Kömek: {OWNER_PHONE}",
         reply_markup=main_kb()
     )
